@@ -1,1 +1,878 @@
+import React, { useState, useRef, useCallback, useMemo } from 'react';
+import { Upload, Download, Play, BarChart3, AlertCircle, CheckCircle, XCircle, Info, Zap, Thermometer, Clock, Target, TrendingUp, Filter, Settings, Eye } from 'lucide-react';
+import * as tf from 'tensorflow';
+
+const WaferYieldAnalyzer = () => {
+  const [data, setData] = useState(null);
+  const [model, setModel] = useState(null);
+  const [predictions, setPredictions] = useState(null);
+  const [isTraining, setIsTraining] = useState(false);
+  const [isProcessing, setIsProcessing] = useState(false);
+  const [stats, setStats] = useState(null);
+  const [selectedDie, setSelectedDie] = useState(null);
+  const [viewMode, setViewMode] = useState('yield'); // yield, bin, defects
+  const [selectedParameters, setSelectedParameters] = useState([]);
+  const [trainingProgress, setTrainingProgress] = useState(0);
+  const fileInputRef = useRef(null);
+
+  // Industry-standard parameter definitions
+  const parameterCategories = {
+    'DC Parameters': [
+      { name: 'VTH_25C', unit: 'V', spec: [0.5, 1.2], description: 'Threshold Voltage at 25°C' },
+      { name: 'VTH_85C', unit: 'V', spec: [0.4, 1.3], description: 'Threshold Voltage at 85°C' },
+      { name: 'VTH_125C', unit: 'V', spec: [0.3, 1.4], description: 'Threshold Voltage at 125°C' },
+      { name: 'Ron_25C', unit: 'mΩ', spec: [0, 150], description: 'On-Resistance at 25°C' },
+      { name: 'Ron_85C', unit: 'mΩ', spec: [0, 200], description: 'On-Resistance at 85°C' },
+      { name: 'Ron_125C', unit: 'mΩ', spec: [0, 250], description: 'On-Resistance at 125°C' },
+      { name: 'IG_25C', unit: 'nA', spec: [0, 100], description: 'Gate Leakage at 25°C' },
+      { name: 'IG_125C', unit: 'nA', spec: [0, 500], description: 'Gate Leakage at 125°C' },
+      { name: 'IDSS', unit: 'μA', spec: [0, 50], description: 'Drain-Source Leakage' },
+      { name: 'BVdss', unit: 'V', spec: [600, 1000], description: 'Breakdown Voltage' }
+    ],
+    'AC Parameters': [
+      { name: 'Qg', unit: 'nC', spec: [0, 100], description: 'Gate Charge' },
+      { name: 'Ciss', unit: 'pF', spec: [0, 5000], description: 'Input Capacitance' },
+      { name: 'Coss', unit: 'pF', spec: [0, 1000], description: 'Output Capacitance' },
+      { name: 'Crss', unit: 'pF', spec: [0, 200], description: 'Reverse Transfer Capacitance' },
+      { name: 'td_on', unit: 'ns', spec: [0, 50], description: 'Turn-on Delay Time' },
+      { name: 'td_off', unit: 'ns', spec: [0, 100], description: 'Turn-off Delay Time' },
+      { name: 'tr', unit: 'ns', spec: [0, 30], description: 'Rise Time' },
+      { name: 'tf', unit: 'ns', spec: [0, 30], description: 'Fall Time' }
+    ],
+    'Process Monitoring': [
+      { name: 'CD_gate', unit: 'nm', spec: [28, 32], description: 'Gate Critical Dimension' },
+      { name: 'thickness_ox', unit: 'nm', spec: [1.8, 2.2], description: 'Oxide Thickness' },
+      { name: 'overlay_X', unit: 'nm', spec: [-10, 10], description: 'X Overlay Error' },
+      { name: 'overlay_Y', unit: 'nm', spec: [-10, 10], description: 'Y Overlay Error' },
+      { name: 'defect_count', unit: '#', spec: [0, 5], description: 'Defect Count per Die' },
+      { name: 'uniformity', unit: '%', spec: [95, 100], description: 'Process Uniformity' }
+    ],
+    'Reliability': [
+      { name: 'HTGB_hours', unit: 'h', spec: [1000, 10000], description: 'High Temp Gate Bias Life' },
+      { name: 'TC_cycles', unit: '#', spec: [1000, 10000], description: 'Temperature Cycling' },
+      { name: 'ESD_HBM', unit: 'kV', spec: [2, 8], description: 'ESD Human Body Model' },
+      { name: 'latch_up', unit: 'mA', spec: [100, 1000], description: 'Latch-up Current' }
+    ]
+  };
+
+  const binCategories = {
+    'BIN_1': { label: 'Prime', color: '#22c55e', description: 'All specs pass, premium grade' },
+    'BIN_2': { label: 'Standard', color: '#3b82f6', description: 'Good performance, standard grade' },
+    'BIN_3': { label: 'Low Power', color: '#f59e0b', description: 'Lower performance, value grade' },
+    'BIN_4': { label: 'Marginal', color: '#f97316', description: 'Marginal performance' },
+    'BIN_5': { label: 'Fail_Electrical', color: '#ef4444', description: 'Electrical parameter failure' },
+    'BIN_6': { label: 'Fail_Functional', color: '#dc2626', description: 'Functional test failure' },
+    'BIN_7': { label: 'Fail_Reliability', color: '#991b1b', description: 'Reliability test failure' },
+    'BIN_8': { label: 'Defect', color: '#000000', description: 'Physical defect detected' }
+  };
+
+  // Generate comprehensive synthetic wafer data
+  const generateIndustrialData = () => {
+    const data = [];
+    const waferRadius = 18;
+    const centerX = 20;
+    const centerY = 20;
+    
+    // Get all parameters
+    const allParams = Object.values(parameterCategories).flat();
+    
+    for (let x = 0; x < 40; x++) {
+      for (let y = 0; y < 40; y++) {
+        const distanceFromCenter = Math.sqrt((x - centerX) ** 2 + (y - centerY) ** 2);
+        
+        if (distanceFromCenter <= waferRadius) {
+          const die = { Die_X: x, Die_Y: y };
+          
+          // Radial gradient effects (edge effects)
+          const edgeFactor = Math.min(distanceFromCenter / waferRadius, 1);
+          const radialNoise = (Math.random() - 0.5) * 0.3;
+          
+          // Process variation patterns
+          const processVariation = Math.sin(x * 0.2) * Math.cos(y * 0.2) * 0.15;
+          const lotVariation = Math.sin(x * 0.05) * Math.sin(y * 0.05) * 0.1;
+          
+          // Generate parameters for each category
+          allParams.forEach(param => {
+            const [minSpec, maxSpec] = param.spec;
+            const nominal = (minSpec + maxSpec) / 2;
+            const tolerance = (maxSpec - minSpec) * 0.3;
+            
+            // Temperature effects for electrical parameters
+            let tempEffect = 0;
+            if (param.name.includes('125C')) tempEffect = 0.2;
+            if (param.name.includes('85C')) tempEffect = 0.1;
+            
+            // Parameter-specific variations
+            let value = nominal + 
+                       (radialNoise * tolerance) + 
+                       (processVariation * tolerance) + 
+                       (lotVariation * tolerance) + 
+                       (tempEffect * tolerance) +
+                       (edgeFactor * tolerance * 0.5);
+            
+            // Add realistic parameter correlations
+            if (param.name.includes('Ron') && edgeFactor > 0.8) value *= 1.3;
+            if (param.name.includes('IG') && edgeFactor > 0.7) value *= 2;
+            if (param.name === 'defect_count' && edgeFactor > 0.9) value = Math.random() * 8;
+            
+            die[param.name] = parseFloat(value.toFixed(param.unit === 'nm' ? 1 : 3));
+          });
+          
+          // Determine bin based on parameter values
+          let bin = 'BIN_1'; // Start with prime
+          let failureReasons = [];
+          
+          // Check each parameter against specs
+          allParams.forEach(param => {
+            const value = die[param.name];
+            const [minSpec, maxSpec] = param.spec;
+            
+            if (value < minSpec || value > maxSpec) {
+              failureReasons.push(param.name);
+              if (param.name.includes('defect') || param.name === 'latch_up') {
+                bin = 'BIN_8'; // Defect
+              } else if (param.name.includes('HTGB') || param.name.includes('TC') || param.name.includes('ESD')) {
+                bin = 'BIN_7'; // Reliability fail
+              } else if (param.name.includes('td_') || param.name.includes('Ciss')) {
+                bin = 'BIN_6'; // Functional fail
+              } else {
+                if (bin === 'BIN_1') bin = 'BIN_5'; // Electrical fail
+              }
+            }
+          });
+          
+          // Downgrade based on performance
+          if (bin === 'BIN_1') {
+            const performance = 1 - edgeFactor * 0.3 - Math.abs(processVariation) * 0.5;
+            if (performance < 0.9) bin = 'BIN_2';
+            if (performance < 0.7) bin = 'BIN_3';
+            if (performance < 0.5) bin = 'BIN_4';
+          }
+          
+          die.Bin = bin;
+          die.Pass = ['BIN_1', 'BIN_2', 'BIN_3'].includes(bin) ? 1 : 0;
+          die.failure_modes = failureReasons.join(',');
+          die.test_time = Math.random() * 10 + 5; // Test time in seconds
+          
+          data.push(die);
+        }
+      }
+    }
+    
+    return {
+      headers: ['Die_X', 'Die_Y', ...allParams.map(p => p.name), 'Bin', 'Pass', 'failure_modes', 'test_time'],
+      data: data
+    };
+  };
+
+  // Parse CSV with comprehensive validation
+  const parseCSV = (csvText) => {
+    const lines = csvText.trim().split('\n');
+    const headers = lines[0].split(',').map(h => h.trim());
+    const data = [];
+    
+    // Validate required columns
+    const requiredCols = ['Die_X', 'Die_Y', 'Pass'];
+    const missingCols = requiredCols.filter(col => !headers.includes(col));
+    if (missingCols.length > 0) {
+      throw new Error(`Missing required columns: ${missingCols.join(', ')}`);
+    }
+    
+    for (let i = 1; i < lines.length; i++) {
+      const values = lines[i].split(',');
+      const row = {};
+      headers.forEach((header, index) => {
+        const value = values[index]?.trim();
+        if (value && !isNaN(value)) {
+          row[header] = parseFloat(value);
+        } else {
+          row[header] = value || '';
+        }
+      });
+      data.push(row);
+    }
+    
+    return { headers, data };
+  };
+
+  // Handle file upload
+  const handleFileUpload = async (event) => {
+    const file = event.target.files[0];
+    if (!file) return;
+
+    setIsProcessing(true);
+    try {
+      const text = await file.text();
+      const parsedData = parseCSV(text);
+      setData(parsedData);
+      calculateStatistics(parsedData.data);
+      
+      // Auto-select available parameters for training
+      const availableParams = Object.values(parameterCategories).flat()
+        .filter(param => parsedData.headers.includes(param.name))
+        .map(param => param.name);
+      setSelectedParameters(availableParams.slice(0, 10)); // Select first 10
+      
+    } catch (error) {
+      console.error('Error parsing file:', error);
+      alert(`Error parsing file: ${error.message}`);
+    }
+    setIsProcessing(false);
+  };
+
+  // Load comprehensive demo data
+  const loadDemoData = () => {
+    setIsProcessing(true);
+    setTimeout(() => {
+      const industrialData = generateIndustrialData();
+      setData(industrialData);
+      calculateStatistics(industrialData.data);
+      
+      // Select key parameters for training
+      setSelectedParameters([
+        'VTH_25C', 'VTH_125C', 'Ron_25C', 'Ron_125C', 'IG_25C', 'IG_125C',
+        'BVdss', 'Qg', 'defect_count', 'CD_gate'
+      ]);
+      
+      setIsProcessing(false);
+    }, 1000);
+  };
+
+  // Calculate comprehensive statistics
+  const calculateStatistics = (diesData) => {
+    const totalDies = diesData.length;
+    const binCounts = {};
+    
+    Object.keys(binCategories).forEach(bin => {
+      binCounts[bin] = diesData.filter(d => d.Bin === bin).length;
+    });
+    
+    const passingDies = diesData.filter(d => d.Pass === 1).length;
+    const yieldRate = (passingDies / totalDies * 100).toFixed(1);
+    
+    // Calculate parameter statistics
+    const paramStats = {};
+    Object.values(parameterCategories).flat().forEach(param => {
+      const values = diesData.map(d => d[param.name]).filter(v => v !== undefined && !isNaN(v));
+      if (values.length > 0) {
+        paramStats[param.name] = {
+          mean: values.reduce((a, b) => a + b, 0) / values.length,
+          min: Math.min(...values),
+          max: Math.max(...values),
+          std: Math.sqrt(values.reduce((sq, n) => sq + Math.pow(n - (values.reduce((a, b) => a + b, 0) / values.length), 2), 0) / values.length)
+        };
+      }
+    });
+    
+    setStats({
+      totalDies,
+      binCounts,
+      yieldRate,
+      passingDies,
+      paramStats,
+      avgTestTime: diesData.reduce((sum, d) => sum + (d.test_time || 0), 0) / totalDies
+    });
+  };
+
+  // Advanced ML training with progress tracking
+  const trainAdvancedModel = async () => {
+    if (!data || !selectedParameters.length) return;
+
+    setIsTraining(true);
+    setTrainingProgress(0);
+    
+    try {
+      // Prepare training data with selected parameters
+      const X = data.data.map(row => selectedParameters.map(param => row[param] || 0));
+      const y = data.data.map(row => row.Pass);
+
+      // Normalize features
+      const means = selectedParameters.map((_, i) => X.reduce((sum, row) => sum + row[i], 0) / X.length);
+      const stds = selectedParameters.map((_, i) => {
+        const mean = means[i];
+        const variance = X.reduce((sum, row) => sum + Math.pow(row[i] - mean, 2), 0) / X.length;
+        return Math.sqrt(variance) || 1;
+      });
+
+      const XNorm = X.map(row => row.map((val, i) => (val - means[i]) / stds[i]));
+
+      // Create advanced neural network
+      const model = tf.sequential({
+        layers: [
+          tf.layers.dense({ inputShape: [selectedParameters.length], units: 64, activation: 'relu' }),
+          tf.layers.batchNormalization(),
+          tf.layers.dropout({ rate: 0.3 }),
+          tf.layers.dense({ units: 32, activation: 'relu' }),
+          tf.layers.batchNormalization(),
+          tf.layers.dropout({ rate: 0.2 }),
+          tf.layers.dense({ units: 16, activation: 'relu' }),
+          tf.layers.dense({ units: 1, activation: 'sigmoid' })
+        ]
+      });
+
+      model.compile({
+        optimizer: tf.train.adam(0.001),
+        loss: 'binaryCrossentropy',
+        metrics: ['accuracy']
+      });
+
+      const xs = tf.tensor2d(XNorm);
+      const ys = tf.tensor2d(y, [y.length, 1]);
+
+      // Train with progress callbacks
+      await model.fit(xs, ys, {
+        epochs: 100,
+        batchSize: 64,
+        validationSplit: 0.2,
+        callbacks: {
+          onEpochEnd: (epoch, logs) => {
+            setTrainingProgress((epoch + 1) / 100 * 100);
+          }
+        },
+        verbose: 0
+      });
+
+      setModel({ model, means, stds, features: selectedParameters });
+
+      // Generate predictions
+      const predictions = await model.predict(xs).data();
+      const predResults = data.data.map((row, i) => ({
+        ...row,
+        prediction: predictions[i] > 0.5 ? 1 : 0,
+        confidence: predictions[i],
+        risk_score: 1 - predictions[i]
+      }));
+
+      setPredictions(predResults);
+
+      xs.dispose();
+      ys.dispose();
+
+    } catch (error) {
+      console.error('Training error:', error);
+      alert('Error training model. Please check your data and selected parameters.');
+    }
+    
+    setIsTraining(false);
+    setTrainingProgress(0);
+  };
+
+  // Get die color based on view mode
+  const getDieColor = (die) => {
+    if (viewMode === 'bin') {
+      return binCategories[die.Bin]?.color || '#6b7280';
+    }
+    
+    if (viewMode === 'defects') {
+      const defectCount = die.defect_count || 0;
+      if (defectCount === 0) return '#22c55e';
+      if (defectCount <= 2) return '#f59e0b';
+      if (defectCount <= 5) return '#f97316';
+      return '#ef4444';
+    }
+    
+    // Default yield view
+    if (!predictions) {
+      return die.Pass === 1 ? '#22c55e' : '#ef4444';
+    }
+    
+    const prediction = predictions.find(p => p.Die_X === die.Die_X && p.Die_Y === die.Die_Y);
+    if (!prediction) return '#6b7280';
+    
+    const intensity = 0.4 + prediction.confidence * 0.6;
+    if (prediction.prediction === 1) {
+      return `rgba(34, 197, 94, ${intensity})`;
+    } else {
+      return `rgba(239, 68, 68, ${intensity})`;
+    }
+  };
+
+  // Handle die selection
+  const handleDieClick = (die) => {
+    const prediction = predictions?.find(p => p.Die_X === die.Die_X && p.Die_Y === die.Die_Y);
+    setSelectedDie(prediction || die);
+  };
+
+  // Download comprehensive results
+  const downloadResults = () => {
+    if (!predictions) return;
+    
+    const headers = [
+      'Die_X', 'Die_Y', 'Actual_Pass', 'Predicted_Pass', 'Confidence', 'Risk_Score', 'Bin',
+      ...selectedParameters, 'failure_modes', 'test_time'
+    ];
+    
+    const csvContent = [
+      headers.join(','),
+      ...predictions.map(p => [
+        p.Die_X, p.Die_Y, p.Pass, p.prediction, p.confidence.toFixed(4), p.risk_score.toFixed(4), p.Bin,
+        ...selectedParameters.map(param => p[param] || ''),
+        p.failure_modes || '', p.test_time || ''
+      ].join(','))
+    ].join('\n');
+    
+    const blob = new Blob([csvContent], { type: 'text/csv' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = 'industrial_wafer_analysis.csv';
+    a.click();
+    URL.revokeObjectURL(url);
+  };
+
+  return (
+    <div className="min-h-screen bg-gradient-to-br from-slate-900 via-blue-900 to-slate-900 p-4">
+      <div className="max-w-[1800px] mx-auto">
+        {/* Header */}
+        <div className="text-center mb-6">
+          <h1 className="text-4xl font-bold text-white mb-2">
+            Industrial Wafer Yield Analysis System
+          </h1>
+          <p className="text-blue-200 text-lg">
+            Comprehensive parametric testing, bin analysis, and ML-powered yield prediction
+          </p>
+        </div>
+
+        {/* Controls */}
+        <div className="bg-white/10 backdrop-blur-lg rounded-xl p-4 mb-6 border border-white/20">
+          <div className="flex flex-wrap gap-3 items-center justify-center">
+            <input
+              type="file"
+              accept=".csv"
+              onChange={handleFileUpload}
+              ref={fileInputRef}
+              className="hidden"
+            />
+            
+            <button
+              onClick={() => fileInputRef.current?.click()}
+              disabled={isProcessing}
+              className="flex items-center gap-2 px-4 py-2 bg-blue-600 hover:bg-blue-700 text-white rounded-lg font-medium transition-colors disabled:opacity-50"
+            >
+              <Upload className="w-4 h-4" />
+              Upload Industrial Data
+            </button>
+
+            <button
+              onClick={loadDemoData}
+              disabled={isProcessing}
+              className="flex items-center gap-2 px-4 py-2 bg-green-600 hover:bg-green-700 text-white rounded-lg font-medium transition-colors disabled:opacity-50"
+            >
+              <BarChart3 className="w-4 h-4" />
+              Load Industrial Demo
+            </button>
+
+            <button
+              onClick={trainAdvancedModel}
+              disabled={!data || isTraining || !selectedParameters.length}
+              className="flex items-center gap-2 px-4 py-2 bg-purple-600 hover:bg-purple-700 text-white rounded-lg font-medium transition-colors disabled:opacity-50"
+            >
+              <Play className="w-4 h-4" />
+              {isTraining ? `Training... ${Math.round(trainingProgress)}%` : 'Train ML Model'}
+            </button>
+
+            {predictions && (
+              <button
+                onClick={downloadResults}
+                className="flex items-center gap-2 px-4 py-2 bg-amber-600 hover:bg-amber-700 text-white rounded-lg font-medium transition-colors"
+              >
+                <Download className="w-4 h-4" />
+                Export Analysis
+              </button>
+            )}
+
+            {/* View Mode Selector */}
+            <div className="flex gap-1 bg-black/20 rounded-lg p-1">
+              {[
+                { mode: 'yield', label: 'Yield', icon: CheckCircle },
+                { mode: 'bin', label: 'Bins', icon: Target },
+                { mode: 'defects', label: 'Defects', icon: AlertCircle }
+              ].map(({ mode, label, icon: Icon }) => (
+                <button
+                  key={mode}
+                  onClick={() => setViewMode(mode)}
+                  className={`flex items-center gap-1 px-3 py-1 rounded text-sm transition-colors ${
+                    viewMode === mode ? 'bg-blue-600 text-white' : 'text-blue-200 hover:bg-white/10'
+                  }`}
+                >
+                  <Icon className="w-3 h-3" />
+                  {label}
+                </button>
+              ))}
+            </div>
+          </div>
+        </div>
+
+        {/* Statistics Dashboard */}
+        {stats && (
+          <div className="grid grid-cols-2 md:grid-cols-4 lg:grid-cols-6 gap-3 mb-6">
+            <div className="bg-white/10 backdrop-blur-lg rounded-xl p-4 border border-white/20">
+              <div className="flex items-center justify-between">
+                <div>
+                  <p className="text-blue-200 text-xs">Total Dies</p>
+                  <p className="text-white text-lg font-bold">{stats.totalDies}</p>
+                </div>
+                <Info className="w-6 h-6 text-blue-400" />
+              </div>
+            </div>
+            
+            <div className="bg-white/10 backdrop-blur-lg rounded-xl p-4 border border-white/20">
+              <div className="flex items-center justify-between">
+                <div>
+                  <p className="text-green-200 text-xs">Yield Rate</p>
+                  <p className="text-white text-lg font-bold">{stats.yieldRate}%</p>
+                </div>
+                <TrendingUp className="w-6 h-6 text-green-400" />
+              </div>
+            </div>
+
+            <div className="bg-white/10 backdrop-blur-lg rounded-xl p-4 border border-white/20">
+              <div className="flex items-center justify-between">
+                <div>
+                  <p className="text-blue-200 text-xs">BIN 1 (Prime)</p>
+                  <p className="text-white text-lg font-bold">{stats.binCounts.BIN_1 || 0}</p>
+                </div>
+                <CheckCircle className="w-6 h-6 text-blue-400" />
+              </div>
+            </div>
+
+            <div className="bg-white/10 backdrop-blur-lg rounded-xl p-4 border border-white/20">
+              <div className="flex items-center justify-between">
+                <div>
+                  <p className="text-red-200 text-xs">Electrical Fails</p>
+                  <p className="text-white text-lg font-bold">{stats.binCounts.BIN_5 || 0}</p>
+                </div>
+                <Zap className="w-6 h-6 text-red-400" />
+              </div>
+            </div>
+
+            <div className="bg-white/10 backdrop-blur-lg rounded-xl p-4 border border-white/20">
+              <div className="flex items-center justify-between">
+                <div>
+                  <p className="text-orange-200 text-xs">Defects</p>
+                  <p className="text-white text-lg font-bold">{stats.binCounts.BIN_8 || 0}</p>
+                </div>
+                <AlertCircle className="w-6 h-6 text-orange-400" />
+              </div>
+            </div>
+
+            <div className="bg-white/10 backdrop-blur-lg rounded-xl p-4 border border-white/20">
+              <div className="flex items-center justify-between">
+                <div>
+                  <p className="text-purple-200 text-xs">Avg Test Time</p>
+                  <p className="text-white text-lg font-bold">{(stats.avgTestTime || 0).toFixed(1)}s</p>
+                </div>
+                <Clock className="w-6 h-6 text-purple-400" />
+              </div>
+            </div>
+          </div>
+        )}
+
+        {/* Main Content */}
+        <div className="grid grid-cols-1 xl:grid-cols-4 gap-6">
+          {/* Wafer Map */}
+          <div className="xl:col-span-2">
+            <div className="bg-white/10 backdrop-blur-lg rounded-xl p-6 border border-white/20">
+              <div className="flex justify-between items-center mb-4">
+                <h2 className="text-xl font-semibold text-white">
+                  Wafer Map - {viewMode.charAt(0).toUpperCase() + viewMode.slice(1)} View
+                </h2>
+                {predictions && (
+                  <div className="text-sm text-blue-200">
+                    ML Predictions Active
+                  </div>
+                )}
+              </div>
+              
+              {data ? (
+                <div className="bg-black/20 rounded-lg p-4 overflow-auto">
+                  <svg width="600" height="600" className="mx-auto">
+                    {/* Wafer outline */}
+                    <circle cx="300" cy="300" r="290" fill="none" stroke="#ffffff40" strokeWidth="2" />
+                    <circle cx="300" cy="300" r="280" fill="none" stroke="#ffffff20" strokeWidth="1" />
+                    
+                    {/* Dies */}
+                    {data.data.map((die, index) => (
+                      <rect
+                        key={index}
+                        x={die.Die_X * 14 + 20}
+                        y={die.Die_Y * 14 + 20}
+                        width="12"
+                        height="12"
+                        fill={getDieColor(die)}
+                        stroke="#ffffff15"
+                        strokeWidth="0.5"
+                        className="cursor-pointer hover:stroke-white hover:stroke-2"
+                        onClick={() => handleDieClick(die)}
+                      />
+                    ))}
+                    
+                    {/* Wafer notch */}
+                    <path d="M 300 10 L 290 25 L 310 25 Z" fill="#ffffff40" />
+                  </svg>
+                  
+                  {/* Legend */}
+                  <div className="mt-4">
+                    {viewMode === 'bin' && (
+                      <div className="grid grid-cols-2 lg:grid-cols-4 gap-2 text-xs">
+                        {Object.entries(binCategories).map(([bin, info]) => (
+                          <div key={bin} className="flex items-center gap-2">
+                            <div className="w-3 h-3 rounded" style={{ backgroundColor: info.color }}></div>
+                            <span className="text-white">{info.label}</span>
+                          </div>
+                        ))}
+                      </div>
+                    )}
+                    
+                    {viewMode === 'yield' && (
+                      <div className="flex justify-center gap-6 text-sm">
+                        <div className="flex items-center gap-2">
+                          <div className="w-4 h-4 bg-green-500 rounded"></div>
+                          <span className="text-white">Pass</span>
+                        </div>
+                        <div className="flex items-center gap-2">
+                          <div className="w-4 h-4 bg-red-500 rounded"></div>
+                          <span className="text-white">Fail</span>
+                        </div>
+                      </div>
+                    )}
+                    
+                    {viewMode === 'defects' && (
+                      <div className="flex justify-center gap-4 text-xs">
+                        <div className="flex items-center gap-1">
+                          <div className="w-3 h-3 bg-green-500 rounded"></div>
+                          <span className="text-white">0 Defects</span>
+                        </div>
+                        <div className="flex items-center gap-1">
+                          <div className="w-3 h-3 bg-yellow-500 rounded"></div>
+                          <span className="text-white">1-2 Defects</span>
+                        </div>
+                        <div className="flex items-center gap-1">
+                          <div className="w-3 h-3 bg-orange-500 rounded"></div>
+                          <span className="text-white">3-5 Defects</span>
+                        </div>
+                        <div className="flex items-center gap-1">
+                          <div className="w-3 h-3 bg-red-500 rounded"></div>
+                          <span className="text-white">5+ Defects</span>
+                        </div>
+                      </div>
+                    )}
+                  </div>
+                </div>
+              ) : (
+                <div className="bg-black/20 rounded-lg p-12 text-center">
+                  <AlertCircle className="w-16 h-16 text-blue-400 mx-auto mb-4" />
+                  <p className="text-blue-200 text-lg mb-2">No industrial data loaded</p>
+                  <p className="text-blue-300 text-sm">
+                    Upload comprehensive test data or load industrial demo
+                  </p>
+                </div>
+              )}
+            </div>
+          </div>
+
+          {/* Right Panel */}
+          <div className="xl:col-span-2 space-y-6">
+            {/* Parameter Selection */}
+            {data && (
+              <div className="bg-white/10 backdrop-blur-lg rounded-xl p-6 border border-white/20">
+                <h3 className="text-lg font-semibold text-white mb-4 flex items-center gap-2">
+                  <Settings className="w-5 h-5" />
+                  ML Training Parameters
+                </h3>
+                
+                <div className="space-y-3 max-h-60 overflow-y-auto">
+                  {Object.entries(parameterCategories).map(([category, params]) => (
+                    <div key={category}>
+                      <h4 className="text-sm font-medium text-blue-200 mb-2">{category}</h4>
+                      <div className="grid grid-cols-2 gap-2">
+                        {params.map(param => {
+                          const isAvailable = data.headers.includes(param.name);
+                          const isSelected = selectedParameters.includes(param.name);
+                          
+                          return (
+                            <label key={param.name} className={`flex items-center gap-2 text-xs p-2 rounded cursor-pointer transition-colors ${
+                              isAvailable ? 'hover:bg-white/10' : 'opacity-50 cursor-not-allowed'
+                            } ${isSelected ? 'bg-blue-600/30' : ''}`}>
+                              <input
+                                type="checkbox"
+                                checked={isSelected}
+                                disabled={!isAvailable}
+                                onChange={(e) => {
+                                  if (e.target.checked) {
+                                    setSelectedParameters([...selectedParameters, param.name]);
+                                  } else {
+                                    setSelectedParameters(selectedParameters.filter(p => p !== param.name));
+                                  }
+                                }}
+                                className="rounded"
+                              />
+                              <span className="text-white">{param.name}</span>
+                              <span className="text-blue-300">({param.unit})</span>
+                            </label>
+                          );
+                        })}
+                      </div>
+                    </div>
+                  ))}
+                </div>
+                
+                <div className="mt-4 text-center">
+                  <p className="text-blue-200 text-sm">
+                    Selected: {selectedParameters.length} parameters
+                  </p>
+                </div>
+              </div>
+            )}
+
+            {/* Die Details */}
+            <div className="bg-white/10 backdrop-blur-lg rounded-xl p-6 border border-white/20">
+              <h3 className="text-lg font-semibold text-white mb-4 flex items-center gap-2">
+                <Eye className="w-5 h-5" />
+                Die Analysis
+              </h3>
+              
+              {selectedDie ? (
+                <div className="space-y-4">
+                  {/* Basic Info */}
+                  <div className="grid grid-cols-2 gap-4 text-sm">
+                    <div>
+                      <span className="text-blue-200">Position:</span>
+                      <p className="text-white font-mono">({selectedDie.Die_X}, {selectedDie.Die_Y})</p>
+                    </div>
+                    <div>
+                      <span className="text-blue-200">Bin:</span>
+                      <p className="text-white font-medium">{selectedDie.Bin}</p>
+                    </div>
+                    <div>
+                      <span className="text-blue-200">Actual Result:</span>
+                      <p className={`font-medium ${selectedDie.Pass ? 'text-green-400' : 'text-red-400'}`}>
+                        {selectedDie.Pass ? 'PASS' : 'FAIL'}
+                      </p>
+                    </div>
+                    {selectedDie.prediction !== undefined && (
+                      <div>
+                        <span className="text-blue-200">ML Prediction:</span>
+                        <p className={`font-medium ${selectedDie.prediction ? 'text-green-400' : 'text-red-400'}`}>
+                          {selectedDie.prediction ? 'PASS' : 'FAIL'}
+                        </p>
+                      </div>
+                    )}
+                  </div>
+
+                  {/* Confidence & Risk */}
+                  {selectedDie.confidence !== undefined && (
+                    <div className="space-y-2">
+                      <div>
+                        <div className="flex justify-between text-sm">
+                          <span className="text-blue-200">Confidence:</span>
+                          <span className="text-white">{(selectedDie.confidence * 100).toFixed(1)}%</span>
+                        </div>
+                        <div className="w-full bg-gray-700 rounded-full h-2">
+                          <div 
+                            className="bg-blue-500 h-2 rounded-full" 
+                            style={{ width: `${selectedDie.confidence * 100}%` }}
+                          ></div>
+                        </div>
+                      </div>
+                      
+                      <div>
+                        <div className="flex justify-between text-sm">
+                          <span className="text-blue-200">Risk Score:</span>
+                          <span className="text-white">{(selectedDie.risk_score * 100).toFixed(1)}%</span>
+                        </div>
+                        <div className="w-full bg-gray-700 rounded-full h-2">
+                          <div 
+                            className="bg-red-500 h-2 rounded-full" 
+                            style={{ width: `${selectedDie.risk_score * 100}%` }}
+                          ></div>
+                        </div>
+                      </div>
+                    </div>
+                  )}
+
+                  {/* Key Parameters */}
+                  <div>
+                    <h4 className="text-sm font-medium text-blue-200 mb-2">Key Parameters</h4>
+                    <div className="grid grid-cols-1 gap-2 max-h-40 overflow-y-auto">
+                      {['VTH_25C', 'Ron_25C', 'IG_25C', 'BVdss', 'defect_count'].map(param => {
+                        const value = selectedDie[param];
+                        if (value === undefined) return null;
+                        
+                        const paramInfo = Object.values(parameterCategories).flat().find(p => p.name === param);
+                        const isOutOfSpec = paramInfo && (value < paramInfo.spec[0] || value > paramInfo.spec[1]);
+                        
+                        return (
+                          <div key={param} className="flex justify-between text-xs">
+                            <span className="text-blue-200">{param}:</span>
+                            <span className={`font-mono ${isOutOfSpec ? 'text-red-400' : 'text-white'}`}>
+                              {typeof value === 'number' ? value.toFixed(3) : value}
+                              {paramInfo && ` ${paramInfo.unit}`}
+                            </span>
+                          </div>
+                        );
+                      })}
+                    </div>
+                  </div>
+
+                  {/* Failure Analysis */}
+                  {selectedDie.failure_modes && (
+                    <div>
+                      <h4 className="text-sm font-medium text-blue-200 mb-2">Failure Modes</h4>
+                      <div className="text-xs text-red-300 bg-red-900/30 rounded p-2">
+                        {selectedDie.failure_modes.split(',').map((mode, i) => (
+                          <div key={i}>• {mode}</div>
+                        ))}
+                      </div>
+                    </div>
+                  )}
+                </div>
+              ) : (
+                <p className="text-blue-200 text-sm">Click on a die to view detailed analysis</p>
+              )}
+            </div>
+
+            {/* Training Progress */}
+            {isTraining && (
+              <div className="bg-purple-600/20 backdrop-blur-lg rounded-xl p-6 border border-purple-400/30">
+                <h3 className="text-lg font-semibold text-white mb-4">Training Advanced ML Model</h3>
+                <div className="space-y-3">
+                  <div className="flex justify-between text-sm">
+                    <span className="text-purple-200">Progress:</span>
+                    <span className="text-white">{Math.round(trainingProgress)}%</span>
+                  </div>
+                  <div className="w-full bg-purple-800/30 rounded-full h-3">
+                    <div 
+                      className="bg-purple-400 h-3 rounded-full transition-all duration-300" 
+                      style={{ width: `${trainingProgress}%` }}
+                    ></div>
+                  </div>
+                  <p className="text-purple-200 text-sm">
+                    Training neural network with {selectedParameters.length} parameters...
+                  </p>
+                </div>
+              </div>
+            )}
+
+            {/* Instructions */}
+            <div className="bg-white/10 backdrop-blur-lg rounded-xl p-6 border border-white/20">
+              <h3 className="text-lg font-semibold text-white mb-4">Industrial Data Format</h3>
+              <div className="space-y-2 text-sm text-blue-200">
+                <p><strong>Required columns:</strong> Die_X, Die_Y, Pass</p>
+                <p><strong>Electrical parameters:</strong> VTH_25C, VTH_85C, VTH_125C, Ron_25C, Ron_85C, Ron_125C, IG_25C, IG_125C, IDSS, BVdss</p>
+                <p><strong>AC parameters:</strong> Qg, Ciss, Coss, Crss, td_on, td_off, tr, tf</p>
+                <p><strong>Process data:</strong> CD_gate, thickness_ox, overlay_X, overlay_Y, defect_count, uniformity</p>
+                <p><strong>Reliability:</strong> HTGB_hours, TC_cycles, ESD_HBM, latch_up</p>
+                <p><strong>Optional:</strong> Bin, failure_modes, test_time</p>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+};
+
+export default WaferYieldAnalyzer;
+
 
